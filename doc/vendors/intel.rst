@@ -51,7 +51,7 @@ file load:
     # or
     openFPGALoader -b boardname project_name.rbf
 
-with ``boardname`` = ``de0``, ``cyc1000``, ``c10lp-refkit``, ``de0nano``, ``de0nanoSoc``, ``de23lite`` or ``qmtechCycloneV``.
+with ``boardname`` = ``de0``, ``cyc1000``, ``c10lp-refkit``, ``de0nano``, ``de0nanoSoc``, ``de23lite``, ``stratix10gx`` or ``qmtechCycloneV``.
 
 .. NOTE::
   Agilex 3 and Agilex 5 devices, including the DE23-Lite, must use an
@@ -66,6 +66,57 @@ with ``boardname`` = ``de0``, ``cyc1000``, ``c10lp-refkit``, ``de0nano``, ``de0n
 
       quartus_pfg -c project_name.sof project_name.rbf
       quartus_pfg --check_integrity project_name.rbf
+
+Stratix 10 GX RBF programming
+-----------------------------
+
+Stratix 10 uses an SDM RBF stream for SRAM configuration. SVF loading is not
+supported for these devices.
+
+RBF SRAM programming has been verified on Apple Silicon macOS with Intel
+kit ``DK-DEV-1SGX-L-A``, TA ``J99985-001``, FPGA ``1SG280LU2F50E2VG``
+(observed JTAG ID ``0xc32150dd``), and the onboard USB-Blaster II. Loading
+reached CONF_DONE and application behavior was confirmed on this kit.
+Other Stratix 10 variants have not been verified. SDM flash programming is
+not supported.
+
+The kit JTAG chain usually includes the Stratix 10 and a MAX V CPLD. Use
+``--detect`` to inspect the chain. The ``stratix10gx`` preset selects its unique
+Stratix 10 automatically; ``--index-chain`` remains an explicit override.
+The tested USB-Blaster II firmware is included and installed with the CLI.
+For a macOS installation with bundled runtime libraries, see
+:doc:`/guide/stratix10gx-macos`.
+
+.. code-block:: bash
+
+    openFPGALoader -b stratix10gx --detect
+    openFPGALoader -b stratix10gx project_name.rbf
+
+To use a different probe firmware file or select the chain index explicitly:
+
+.. code-block:: bash
+
+    openFPGALoader -b stratix10gx --probe-firmware \
+        /path/to/blaster_6810.hex --detect
+    openFPGALoader -b stratix10gx --probe-firmware \
+        /path/to/blaster_6810.hex --index-chain 1 project_name.rbf
+
+A successful load reports ``Configuration succeeded (CONF_DONE asserted)``
+after checking SDM configuration status. Quartus is not needed at runtime.
+Firmware provenance and its SHA-256 are recorded in
+``firmware/usbBlasterII/README.txt``.
+
+To create an RBF separately with Quartus Prime Pro, use the Programming File
+Generator for this device:
+
+.. code-block:: bash
+
+    quartus_pfg -c project_name.sof project_name.rbf
+    quartus_pfg --check_integrity project_name.rbf
+
+The observed Stratix 10 / MAX V chain has an extra shift stage. When detection
+recovers the shifted MAX V IDCODE, openFPGALoader verifies the extra stage using
+IR and BYPASS marker scans before applying padding to subsequent scans.
 
 SPI flash
 ---------

@@ -33,6 +33,10 @@ build() {
 
 check() {
   "${srcdir}"/build/openFPGALoader.exe --help
+  cd "${srcdir}"/build
+  cmake -S ../../../../tests -B ../test-build -G "MSYS Makefiles"
+  cmake --build ../test-build
+  ctest --test-dir ../test-build --output-on-failure
 }
 
 package() {

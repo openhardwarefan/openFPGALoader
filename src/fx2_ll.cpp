@@ -152,6 +152,22 @@ int FX2_ll::read(uint8_t endpoint, uint8_t *buff, uint16_t len)
 	return actual_length;
 }
 
+int FX2_ll::read_quiet(uint8_t endpoint, uint8_t *buff, uint16_t len,
+		unsigned timeout_ms)
+{
+	int actual_length = 0;
+	int ret = libusb_bulk_transfer(dev_handle, LIBUSB_ENDPOINT_IN | endpoint,
+			buff, len, &actual_length, timeout_ms);
+	if (ret != LIBUSB_SUCCESS && ret != LIBUSB_ERROR_TIMEOUT)
+		return -1;
+	return actual_length;
+}
+
+bool FX2_ll::clear_halt(uint8_t endpoint)
+{
+	return libusb_clear_halt(dev_handle, endpoint) == LIBUSB_SUCCESS;
+}
+
 /* write len data using control
  */
 int FX2_ll::write_ctrl(uint8_t bRequest, uint16_t wValue,

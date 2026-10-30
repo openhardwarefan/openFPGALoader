@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.10)
 
 # set the project name
 project(openFPGALoader VERSION "1.2.0" LANGUAGES CXX)
+
+# Let modern CMake de-duplicate libraries for Apple's linker.
+if(APPLE AND POLICY CMP0156)
+	cmake_policy(SET CMP0156 NEW)
+endif()
+
 add_definitions(-DVERSION=\"v${PROJECT_VERSION}\")
 
 #if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
@@ -18,6 +24,7 @@ option(ENABLE_OPTIM       "Enable build with -O3 optimization level"            
 option(BUILD_STATIC       "Whether or not to build with static libraries"        OFF)
 option(USE_PKGCONFIG      "Use pkgconfig to find libraries"                      ON)
 option(LINK_CMAKE_THREADS "Use CMake find_package to link the threading library" OFF)
+option(MACOS_BUNDLE_LIBRARIES "Bundle runtime libraries in a relocatable macOS installation" OFF)
 option(WINDOWS_CROSSCOMPILE "Enable cross-compile on windows"                    OFF)
 option(WINDOWS_STATIC_ZLIB "Link zlib statically for Windows builds"             ON)
 
@@ -844,7 +851,45 @@ if (USE_LIBFTDI)
 	add_definitions(-DFTDI_VERSION=${FTDI_VAL})
 endif()
 
-install(TARGETS openFPGALoader DESTINATION bin)
+if (MACOS_BUNDLE_LIBRARIES)
+    if (NOT APPLE)
+        message(FATAL_ERROR "MACOS_BUNDLE_LIBRARIES requires macOS")
+    endif()
+    if (CMAKE_VERSION VERSION_LESS 3.14)
+        message(FATAL_ERROR "MACOS_BUNDLE_LIBRARIES requires CMake 3.14 or newer")
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set_property(TARGET openFPGALoader APPEND_STRING PROPERTY LINK_FLAGS
+        " -Wl,-headerpad_max_install_names")
+    cmake_policy(SET CMP0087 NEW)
+    install(CODE "
+        execute_process(
+            COMMAND \"${Python3_EXECUTABLE}\" -B \"${PROJECT_SOURCE_DIR}/scripts/bundle_macos_install.py\"
+                --binary \"$<TARGET_FILE:openFPGALoader>\"
+                --prefix \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}\"
+            RESULT_VARIABLE bundle_result)
+        if (NOT bundle_result EQUAL 0)
+            message(FATAL_ERROR \"Could not bundle the macOS runtime libraries\")
+        endif()
+    ")
+    install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/licenses/openFPGALoader")
+else()
+    install(TARGETS openFPGALoader DESTINATION bin)
+endif()
+
+if (ENABLE_USB_BLASTERII)
+    install(FILES firmware/usbBlasterII/blaster_6810.hex firmware/usbBlasterII/README.txt
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/openFPGALoader/stratix10gx")
+    add_custom_target(stratix10gx_probe_firmware ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:openFPGALoader>/share/openFPGALoader/stratix10gx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/firmware/usbBlasterII/blaster_6810.hex"
+            "${CMAKE_CURRENT_SOURCE_DIR}/firmware/usbBlasterII/README.txt"
+            "$<TARGET_FILE_DIR:openFPGALoader>/share/openFPGALoader/stratix10gx"
+        DEPENDS openFPGALoader firmware/usbBlasterII/blaster_6810.hex firmware/usbBlasterII/README.txt
+        VERBATIM)
+endif()
 
 ####################################################################################################
 # SPIOverJtag bitstreams install

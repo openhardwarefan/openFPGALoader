@@ -93,6 +93,7 @@ class Altera: public Device, FlashInterface {
 			STRATIXV_FAMILY  = 4,
 			AGILEX3_FAMILY   = 5,
 			AGILEX5_FAMILY   = 6,
+			STRATIX10_FAMILY = 7,
 			CYCLONE_MISC     = 10, // Fixme: idcode shared
 			UNKNOWN_FAMILY   = 999
 		};

@@ -80,6 +80,11 @@ jobs:
         cmake ..
         cmake --build .
 
+        cmake -S ../tests -B tests -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+        cmake --build tests
+        ctest --test-dir tests --output-on-failure
+
         make DESTDIR=$(pwd)/dist install
         _rulesdir='dist/etc/udev/rules.d/'
         mkdir -p "${_rulesdir}"
@@ -126,6 +131,11 @@ jobs:
         cd build
         cmake ..
         cmake --build .
+
+        cmake -S ../tests -B tests -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+        cmake --build tests
+        ctest --test-dir tests --output-on-failure
 
 
   lin-test:

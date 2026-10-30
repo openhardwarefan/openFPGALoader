@@ -166,6 +166,11 @@ static std::map <std::string, target_board_t> board_list = {
 	JTAG_BOARD("de1Soc",          "5CSEMA5",              "usb-blasterII", SPI_FLASH, 0, 0, CABLE_DEFAULT),
 	JTAG_BOARD("de23lite",        "A3CZ135BB18AE7S",      "usb-blasterIII", SPI_FLASH, 0, 0, CABLE_DEFAULT),
 	JTAG_BOARD("deca",            "10M50DA",              "usb-blasterII", SPI_FLASH, 0, 0, CABLE_DEFAULT),
+	/* Tested kit: DK-DEV-1SGX-L-A, TA J99985-001, onboard USB-Blaster II.
+	 * FPGA: 1SG280LU2F50E2VG. Other kit variants have not been verified.
+	 * The unique Stratix 10 is selected automatically; --index-chain overrides it.
+	 */
+	JTAG_BOARD("stratix10gx",     "1SG280LU2F50E2VG",     "usb-blasterII", SPI_FLASH, 0, 0, CABLE_DEFAULT),
 	JTAG_BOARD("dragonL",         "xc6slx25tcsg324",      "",             SPI_FLASH, 0, 0, CABLE_DEFAULT),
 	JTAG_BOARD("ecp5_evn",        "",                     "ft2232",       SPI_FLASH, 0, 0, CABLE_DEFAULT),
 	SPI_BOARD("ecp5_generic",     "lattice", "ecp5", "",

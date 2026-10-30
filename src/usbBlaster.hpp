@@ -95,6 +95,10 @@ class UsbBlaster : public JtagInterface {
 	int writeByte(uint8_t *tdo, int nb_byte);
 	int writeBit(uint8_t *tdo, int nb_bit);
 	int write(bool read, int rd_len);
+	/* USB-Blaster byteshift samples on the opposite TCK edge if TCK is
+	 * high on entry (see OpenOCD ublast_queue_tdi). Drive TCK low first.
+	 */
+	int idleTckLow();
 	int setBitmode(uint8_t mode);
 	int setPassiveSerialPins(bool dclk, bool nconfig, bool data0);
 	bool readConfDone();
@@ -109,6 +113,7 @@ class UsbBlaster : public JtagInterface {
 	int _nb_bit;
 	uint8_t _curr_tms;
 	uint16_t _buffer_size;
+	bool _is_blasterII;
 	bool _passive_serial_mode;
 };
 

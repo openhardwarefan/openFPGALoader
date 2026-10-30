@@ -4,6 +4,7 @@
  */
 
 #include <cstring>
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -226,11 +227,19 @@ Jtag::Jtag(const cable_t &cable, const jtag_pins_conf_t *pin_conf,
 	}
 
 	_tms_buffer = (unsigned char *)malloc(sizeof(unsigned char) * _tms_buffer_size);
-	if (_tms_buffer == nullptr)
+	if (_tms_buffer == nullptr) {
+		delete _jtag;
 		throw std::runtime_error("Error: memory allocation failed");
+	}
 	memset(_tms_buffer, 0, _tms_buffer_size);
 
-	detectChain(32);
+	try {
+		detectChain(32);
+	} catch (...) {
+		free(_tms_buffer);
+		delete _jtag;
+		throw;
+	}
 }
 
 Jtag::~Jtag()
@@ -249,6 +258,7 @@ int Jtag::detectChain(unsigned max_dev)
 	/* cleanup */
 	_devices_list.clear();
 	_irlength_list.clear();
+	_chain_delays.clear();
 	_ir_bits_before = _ir_bits_after = _dr_bits_before = _dr_bits_after = 0;
 	go_test_logic_reset();
 	set_state(SHIFT_DR);
@@ -277,6 +287,15 @@ int Jtag::detectChain(unsigned max_dev)
 			}
 			break;
 		}
+		/* An extra shift stage can leave a partial all-ones word at the
+		 * end of the chain. It is not an IDCODE.
+		 */
+		if (tmp == 0xfffffffe && std::any_of(_chain_delays.begin(),
+			_chain_delays.end(), [](unsigned delay) { return delay != 0; })) {
+			if (_verbose)
+				printInfo("Skipping partial end-of-chain word 0xfffffffe");
+			continue;
+		}
 
 		/* search IDCODE in fpga_list and misc_dev_list
 		 * since most device have idcode with high nibble masked
@@ -293,6 +312,20 @@ int Jtag::detectChain(unsigned max_dev)
 			found = search_and_insert_device_with_idcode(tmp);
 		if (!found) /* if full idcode not found -> search for masked */
 			found = search_and_insert_device_with_idcode(tmp & 0x0fffffff);
+		/* Recover only the observed Stratix 10 / MAX V extra-stage
+		 * signature. Keep unknown-device handling unchanged on other chains.
+		 */
+		auto previous = _devices_list.empty() ? fpga_list.end() : fpga_list.find(_devices_list.front());
+		if (!found && previous != fpga_list.end() && previous->second.family == "stratix 10" &&
+			(tmp >> 1) == 0x020a40dd && search_and_insert_device_with_idcode(tmp >> 1)) {
+			_chain_delays[1]++;
+			if (_verbose) {
+				snprintf(message, sizeof(message),
+					"IDCODE 0x%08x recovered as 0x%08x (>>1)", tmp, tmp >> 1);
+				printInfo(message);
+			}
+			found = true;
+		}
 
 		if (!found) {
 			uint16_t mfg = IDCODE2MANUFACTURERID(tmp);
@@ -310,7 +343,44 @@ int Jtag::detectChain(unsigned max_dev)
 	}
 	set_state(TEST_LOGIC_RESET);
 	flushTMS(true);
+	verify_chain_delays();
 	return _devices_list.size();
+}
+
+void Jtag::verify_chain_delays()
+{
+	unsigned extra = 0, ir_length = 0;
+	for (size_t i = 0; i < _chain_delays.size(); i++) {
+		extra += _chain_delays[i];
+		ir_length += _irlength_list[i];
+	}
+	if (!extra)
+		return;
+
+	/* Shift a marker followed by enough ones to leave every TAP in BYPASS.
+	 * Check the marker's delay independently through the IR and DR chains.
+	 */
+	const uint8_t marker[4] = {0x69, 0x96, 0x5a, 0xa5};
+	auto verify = [&](tapState_t state, unsigned delay) {
+		const unsigned bits = delay + 32;
+		std::vector<uint8_t> tx((bits + 7) / 8, 0xff);
+		std::vector<uint8_t> rx(tx.size(), 0);
+		memcpy(tx.data(), marker, sizeof(marker));
+		set_state(state);
+		read_write(tx.data(), rx.data(), bits, true);
+		set_state(RUN_TEST_IDLE);
+		for (unsigned i = 0; i < 32; i++) {
+			if (((rx[(delay + i) >> 3] >> ((delay + i) & 7)) & 1) !=
+				((marker[i >> 3] >> (i & 7)) & 1))
+				throw std::runtime_error("JTAG chain delay verification failed");
+		}
+	};
+	verify(SHIFT_IR, ir_length + extra);
+	verify(SHIFT_DR, _devices_list.size() + extra);
+	if (_verbose)
+		printInfo("Verified extra JTAG scan stages: " + std::to_string(extra));
+	go_test_logic_reset();
+	flushTMS(true);
 }
 
 bool Jtag::search_and_insert_device_with_idcode(uint32_t idcode)
@@ -339,13 +409,14 @@ bool Jtag::insert_first(uint32_t device_id, uint16_t irlength)
 {
 	_devices_list.insert(_devices_list.begin(), device_id);
 	_irlength_list.insert(_irlength_list.begin(), irlength);
+	_chain_delays.insert(_chain_delays.begin(), 0);
 
 	return true;
 }
 
 int Jtag::device_select(unsigned index)
 {
-	if (index > _devices_list.size())
+	if (index >= _devices_list.size())
 		return -1;
 	device_index = index;
 	/* get number of devices, in the JTAG chain,
@@ -373,6 +444,16 @@ int Jtag::device_select(unsigned index)
 	_ir_bits_before = 0;
 	for (unsigned i = device_index + 1; i < _devices_list.size(); ++i)
 		_ir_bits_before += _irlength_list[i];
+	for (unsigned i = 0; i < _chain_delays.size(); i++) {
+		if (i > device_index) {
+			_ir_bits_before += _chain_delays[i];
+			_dr_bits_before += _chain_delays[i];
+		} else {
+			_ir_bits_after += _chain_delays[i];
+			_dr_bits_after += _chain_delays[i];
+		}
+	}
+	_dr_bits.resize((std::max(_dr_bits_after, _dr_bits_before) + 7)/8, 0);
 	_ir_bits = std::vector<uint8_t>((std::max(_ir_bits_before, _ir_bits_after) + 7) / 8, 0xff); // BYPASS command is all-ones
 
 	return device_index;
@@ -403,12 +484,16 @@ int Jtag::flushTMS(bool flush_buffer)
 		display("%s: %d %x\n", __func__, _num_tms, _tms_buffer[0]);
 
 		ret = _jtag->writeTMS(_tms_buffer, _num_tms, flush_buffer, _curr_tdi);
+		if (ret < 0)
+			throw std::runtime_error("Failed to write JTAG state transitions");
 
 		/* reset buffer and number of bits */
 		memset(_tms_buffer, 0, _tms_buffer_size);
 		_num_tms = 0;
 	} else if (flush_buffer) {
-		_jtag->flush();
+		ret = _jtag->flush();
+		if (ret < 0)
+			throw std::runtime_error("Failed to flush JTAG state transitions");
 	}
 	return ret;
 }
@@ -424,8 +509,13 @@ void Jtag::go_test_logic_reset()
 
 int Jtag::read_write(const uint8_t *tdi, unsigned char *tdo, int len, char last)
 {
+	if (len < 0)
+		throw std::runtime_error("Invalid JTAG scan length");
+	if (len == 0)
+		return 0;
 	flushTMS(false);
-	_jtag->writeTDI(tdi, tdo, len, last);
+	if (_jtag->writeTDI(tdi, tdo, len, last) < 0)
+		throw std::runtime_error("Failed to shift JTAG data");
 	if (last == 1)
 		_state = (_state == SHIFT_DR) ? EXIT1_DR : EXIT1_IR;
 	return 0;

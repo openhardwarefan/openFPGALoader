@@ -335,6 +335,16 @@ static std::map <uint32_t, fpga_model> fpga_list = {
 	/* Altera Stratix V */
 	{0x029070dd, {"altera", "stratix V GS", "5SGSD5", 10}},
 
+	/* Altera/Intel Stratix 10
+	 * Version nibble varies by silicon stepping (0x0 / 0xC observed).
+	 * Device id nibble also varies (0x322 / 0x321 in SOF jtag_id.txt).
+	 * DK-DEV-1SGX-* / sample designs use 1SG280LUxF50E2VG (GX).
+	 */
+	{0x032150dd, {"altera", "stratix 10", "1SG280LU", 10}},
+	{0xc32150dd, {"altera", "stratix 10", "1SG280LU", 10}},
+	{0x032250dd, {"altera", "stratix 10", "1SG280LU", 10}},
+	{0xc32250dd, {"altera", "stratix 10", "1SG280LU", 10}},
+
 	/* Altera/Intel Arria 10 */
 	{0x02ee20dd, {"altera", "arria 10", "GX160",  10}},
 	{0x02e220dd, {"altera", "arria 10", "GX220",  10}},

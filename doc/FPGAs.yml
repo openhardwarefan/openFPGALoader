@@ -146,6 +146,13 @@ Altera:
     Memory: OK
     Flash: OK
 
+  - Description: Stratix 10 GX
+    Model:
+      - 1SG280
+    URL: https://www.altera.com/products/fpga/stratix/stratix-10
+    Memory: RBF
+    Flash: NT
+
   - Description: Cyclone 10 LP
     Model: 10CL025
     URL: https://www.intel.com/content/www/us/en/products/programmable/fpga/cyclone-10.html

@@ -6,10 +6,13 @@
 #include "altera.hpp"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <map>
 #include <string>
+#include <chrono>
+#include <thread>
 
 #include "common.hpp"
 #include "device.hpp"
@@ -49,6 +52,9 @@ Altera::Altera(Jtag *jtag, const std::string &filename,
 		_fpga_family = AGILEX3_FAMILY;
 	} else if (family == "agilex 5") {
 		_fpga_family = AGILEX5_FAMILY;
+	} else if (family == "stratix 10") {
+		/* Stratix 10 uses the SDM mailbox/JTAG configuration path. */
+		_fpga_family = STRATIX10_FAMILY;
 	} else {
 		_fpga_family = CYCLONE_MISC;  // FIXME
 	}
@@ -247,13 +253,14 @@ void Altera::program(unsigned int offset, bool unprotect_flash)
 		return;
 	}
 
-	/* Specific case for Agilex */
-	if (_fpga_family == AGILEX3_FAMILY || _fpga_family == AGILEX5_FAMILY) {
+	/* Specific case for Agilex and Stratix 10 */
+	if (_fpga_family == AGILEX3_FAMILY || _fpga_family == AGILEX5_FAMILY ||
+			_fpga_family == STRATIX10_FAMILY) {
 		if (_mode != Device::MEM_MODE) {
-			printError("Altera: Error Write to flash for Agilex not supported");
-			return;
+			throw std::runtime_error("Flash programming for SDM devices is not supported");
 		}
-		agilex_program();
+		if (!agilex_program())
+			throw std::runtime_error("SDM configuration failed");
 		return;
 	}
 
@@ -1065,7 +1072,11 @@ bool Altera::agilex_poll_status(uint64_t *expected, uint64_t *mask,
 	uint32_t check_len, int max_poll)
 {
 	const uint8_t isc_sr[2] = AGILEX_ISC_SR;
-	_jtag->shiftIR((unsigned char *)isc_sr, NULL, IRLENGTH);
+	/* Match Quartus JAM: IRSCAN → IRPAUSE → IDLE */
+	_jtag->shiftIR((unsigned char *)isc_sr, NULL, IRLENGTH,
+		_fpga_family == STRATIX10_FAMILY ? Jtag::PAUSE_IR : Jtag::RUN_TEST_IDLE);
+	if (_fpga_family == STRATIX10_FAMILY)
+		_jtag->set_state(Jtag::RUN_TEST_IDLE);
 	_jtag->toggleClk(agilex_toggle_length);
 	if (_verbose)
 		printf("Begin\n");
@@ -1100,7 +1111,10 @@ bool Altera::agilex_send_instruction(const uint8_t *cmd, const uint64_t *tx,
 	uint64_t *rx, uint32_t length)
 {
 	unsigned char rx_pkt[5];
-	_jtag->shiftIR((unsigned char *)cmd, NULL, IRLENGTH);
+	_jtag->shiftIR((unsigned char *)cmd, NULL, IRLENGTH,
+		_fpga_family == STRATIX10_FAMILY ? Jtag::PAUSE_IR : Jtag::RUN_TEST_IDLE);
+	if (_fpga_family == STRATIX10_FAMILY)
+		_jtag->set_state(Jtag::RUN_TEST_IDLE);
 	_jtag->toggleClk(agilex_toggle_length);
 	if (!rx && !tx)
 		return true;
@@ -1119,6 +1133,25 @@ bool Altera::agilex_isc_init()
 {
 	const uint8_t cmd[2] = AGILEX_COMMAND;
 
+	/* Check instruction alignment before sending any SDM commands. */
+	if (_fpga_family == STRATIX10_FAMILY) {
+		_jtag->go_test_logic_reset();
+		uint8_t ir_id[2] = {0x06, 0x00};
+		uint8_t dr[4] = {0};
+		_jtag->shiftIR(ir_id, NULL, IRLENGTH);
+		_jtag->shiftDR(NULL, dr, 32);
+		const uint32_t id = (uint32_t)dr[0] | ((uint32_t)dr[1] << 8) |
+			((uint32_t)dr[2] << 16) | ((uint32_t)dr[3] << 24);
+		if (_verbose)
+			printf("Altera: IR IDCODE readback 0x%08x (expect 0x%08x)\n",
+				id, _idcode);
+		if ((id & 0x0fffffff) != (_idcode & 0x0fffffff)) {
+			printError("IDCODE mismatch after instruction scan");
+			return false;
+		}
+		_jtag->go_test_logic_reset();
+	}
+
 	/* Everything is magic here.
 	 * stp0 and step2 are constant for AGILEX3 and AGILEX5 (at least
 	 * with tested devices)
@@ -1129,7 +1162,15 @@ bool Altera::agilex_isc_init()
 	const uint64_t stp1[3] = {0x000000000, 0x1F0001001, 0x27E2DA938};
 	const uint64_t stp2[2] = {0x000000000, 0x200000005};
 
-	if (!agilex_send_instruction(cmd, stp0, NULL, 3)) {
+	/* Stratix 10 (from Quartus 21.4 JAM) omits the leading zero DR word
+	 * used by Agilex3/5; STP1 data also differs per bitstream.
+	 */
+	const bool s10 = (_fpga_family == STRATIX10_FAMILY);
+	const uint64_t stp0_s10[2] = {0x300000000ull, 0x200000000ull};
+	const uint64_t stp1_s10[2] = {0x1F0001001ull, 0x208ADC8A6ull};
+	const uint64_t stp2_s10[1] = {0x200000005ull};
+
+	if (!agilex_send_instruction(cmd, s10 ? stp0_s10 : stp0, NULL, s10 ? 2 : 3)) {
 		printError("Altera: Error during step0 write configuration");
 		return false;
 	}
@@ -1142,13 +1183,14 @@ bool Altera::agilex_isc_init()
 	}
 
 	/* Device specific configuration */
-	if (!agilex_send_instruction(cmd, stp1, NULL, 3)) {
+	if (!agilex_send_instruction(cmd, s10 ? stp1_s10 : stp1, NULL, s10 ? 2 : 3)) {
 		printError("Altera: Error during step0 write configuration");
 		return false;
 	}
 
 	/* Again: magic words */
-	uint64_t stp1_exp[] = {0x3C0004001, (0x3FFFFFFFF & ((stp1[2] << 2) | 0x03))};
+	uint64_t stp1_tail = s10 ? stp1_s10[1] : stp1[2];
+	uint64_t stp1_exp[] = {0x3C0004001, (0x3FFFFFFFF & ((stp1_tail << 2) | 0x03))};
 	uint64_t stp1_mask[] = {0x3FDFFFFFD, 0x3FFFFFFFD};
 	if (!agilex_poll_status(stp1_exp, stp1_mask, 2)) {
 		printError("Altera: Error during Device specific configuration step");
@@ -1156,7 +1198,7 @@ bool Altera::agilex_isc_init()
 	}
 
 	/* Enter ISC Configure mode */
-	if (!agilex_send_instruction(cmd, stp2, NULL, 2)) {
+	if (!agilex_send_instruction(cmd, s10 ? stp2_s10 : stp2, NULL, s10 ? 1 : 2)) {
 		printError("Altera: Error during enter ISC Configure write");
 		return false;
 	}
@@ -1174,6 +1216,28 @@ bool Altera::agilex_isc_init()
 bool Altera::agilex_exit_and_conf_done()
 {
 	const uint8_t cmd[2] = AGILEX_COMMAND;
+	if (_fpga_family == STRATIX10_FAMILY) {
+		/* Quartus JAM DJ31: CONFIG_STATUS returns five 34-bit words.
+		 * The last word must have CONF_DONE asserted (mask bit 2).
+		 */
+		const uint64_t request = 0x200000004ull;
+		uint64_t expected[5] = {0x4001, 1, 1, 1, 7};
+		uint64_t mask[5] = {0x3fc003ffdull, 0x3fffffffdull, 1, 1, 5};
+		for (unsigned attempt = 0; attempt < 15; attempt++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (!agilex_send_instruction(cmd, &request, NULL, 1))
+				return false;
+			if (agilex_poll_status(expected, mask, 5, 75)) {
+				const uint8_t bypass[2] = AGILEX_BYPASS;
+				_jtag->shiftIR((unsigned char *)bypass, NULL, IRLENGTH);
+				_jtag->toggleClk(agilex_toggle_length);
+				printSuccess("Configuration succeeded (CONF_DONE asserted)");
+				return true;
+			}
+		}
+		printError("Stratix 10 configuration status did not assert CONF_DONE");
+		return false;
+	}
 	const uint8_t sr[2] = AGILEX_ISC_SR;
 	const uint8_t bypass[2] = AGILEX_BYPASS;
 	const uint8_t done0[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
@@ -1208,6 +1272,7 @@ bool Altera::agilex_exit_and_conf_done()
 
 bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 {
+	const bool stratix10 = (_fpga_family == STRATIX10_FAMILY);
 	const uint8_t stat_cmd[2] = AGILEX_IRFLOW;
 	const uint8_t cmd[2] = AGILEX_ISC_PROGRAM;
 	const uint8_t start[5] = {0x07, 0x00, 0x00, 0x00, 0x00};
@@ -1229,11 +1294,14 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 	/* Pre command */
 	_jtag->shiftIR((unsigned char *)stat_cmd, NULL, IRLENGTH);
 	_jtag->toggleClk(agilex_toggle_length);
-	_jtag->shiftDR((unsigned char *)start, NULL, 34);
+	_jtag->shiftDR((unsigned char *)start, NULL,
+		stratix10 ? 37 : 34);
 	_jtag->toggleClk(agilex_toggle_length);
 
 	uint32_t wr_pos = 0;
 	uint32_t curr_xfer_len = xfer_min_length;
+	uint32_t furthest = 0;
+	unsigned stalled = 0;
 
 	ProgressBar progress("Load SRAM", length, 50, false);
 
@@ -1252,6 +1320,7 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 		uint8_t stat_rx[5];
 		uint64_t res;
 		bool busy, error;
+		unsigned polls = 0;
 		do {
 			_jtag->shiftIR((unsigned char *)stat_cmd, NULL, IRLENGTH);
 			_jtag->toggleClk(agilex_toggle_length);
@@ -1262,17 +1331,36 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 			error = ((res >> 1) & 0x01);
 			if (error) {
 				progress.fail();
-				printError("Device Configuration Error");
+				char detail[160];
+				snprintf(detail, sizeof(detail), "Device configuration error at byte %u, status 0x%010" PRIx64,
+					wr_pos, res);
+				printError(detail);
 				return false;
 			}
 			stat_tx[0] = 0x01;
+			if (stratix10 && ++polls >= 6000 && busy) {
+				progress.fail();
+				char detail[192];
+				snprintf(detail, sizeof(detail), "Timed out waiting for configuration flow control at byte %u "
+					"(chunk %u, status 0x%010" PRIx64 ")", wr_pos, xfer_len, res);
+				printError(detail);
+				return false;
+			}
 
 		} while(busy);
 
-		const uint32_t offset_after_write = wr_pos + curr_xfer_len;
+		const uint32_t offset_after_write = wr_pos + (stratix10 ? xfer_len : curr_xfer_len);
 		// next position is provided by the FPGA
 		// it's a x 4
-		wr_pos = res & (~0x03);
+		const uint32_t next = uint32_t(res) & ~uint32_t(3);
+		if (stratix10 && (next > offset_after_write || next > length ||
+			(next <= furthest && ++stalled >= 128))) {
+			progress.fail();
+			printError("Invalid or stalled configuration flow-control position");
+			return false;
+		}
+		wr_pos = uint32_t(next);
+		if (stratix10 && wr_pos > furthest) { furthest = wr_pos; stalled = 0; }
 
 		/* search if we have to increase or reduce curr_xfer_len */
 		if (offset_after_write == wr_pos)
@@ -1288,7 +1376,7 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 
 bool Altera::agilex_program()
 {
-	RawParser rbf(_filename, _verbose);
+	RawParser rbf(_filename, _fpga_family != STRATIX10_FAMILY && _verbose);
 	rbf.parse();
 
 	const uint32_t rbf_length = rbf.getLength() / 8;

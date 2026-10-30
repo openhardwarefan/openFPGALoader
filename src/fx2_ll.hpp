@@ -55,6 +55,10 @@ class FX2_ll {
 		 * \return -1 when transfer fails, number of bytes otherwise
 		 */
 		int read(uint8_t endpoint, uint8_t *buff, uint16_t len);
+		/*! Quiet bulk read with custom timeout (ms); no error print. */
+		int read_quiet(uint8_t endpoint, uint8_t *buff, uint16_t len, unsigned timeout_ms);
+		/*! Clear halt on a complete endpoint address, including direction. */
+		bool clear_halt(uint8_t endpoint);
 		/*!
 		 * \brief control write
 		 * \param[in] bRequest

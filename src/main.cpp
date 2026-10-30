@@ -54,6 +54,7 @@
 #endif
 #include "jtag.hpp"
 #include "part.hpp"
+#include "stratix10gx.hpp"
 #include "progressBar.hpp"
 #include "spiFlash.hpp"
 #include "rawParser.hpp"
@@ -178,6 +179,12 @@ int main(int argc, char **argv)
 	int ret = parse_opt(argc, argv, &args, &pins_config);
 	if (ret != 0)
 		return (ret == 1) ? EXIT_SUCCESS : EXIT_FAILURE;
+	if (args.board == "stratix10gx") {
+		for (const auto &directory : {Stratix10GX::userDirectory(),Stratix10GX::portableDirectory(),
+			Stratix10GX::installedDirectory()})
+			if (args.probe_firmware.empty())
+				args.probe_firmware = Stratix10GX::existingFile(directory,"blaster_6810.hex");
+	}
 
 	if (args.force_terminal_mode)
 		ProgressBar::setForceTerminalMode();
@@ -475,6 +482,16 @@ int main(int argc, char **argv)
 	}
 
 	if (found != 0) {
+		if (args.board == "stratix10gx" && args.index_chain < 0) {
+			const int target = Stratix10GX::targetIndex(listDev);
+			if (target < 0) {
+				printError(target == -2 ? "More than one Stratix 10 found; use --index-chain" :
+					"No Stratix 10 found in the detected chain");
+				delete jtag;
+				return EXIT_FAILURE;
+			}
+			args.index_chain = target;
+		}
 		if (args.index_chain < 0) {
 			for (size_t i = 0; i < found; i++) {
 				if (fpga_list.find(listDev[i]) != fpga_list.end()) {
@@ -493,7 +510,7 @@ int main(int argc, char **argv)
 			}
 		} else {
 			index = args.index_chain;
-			if (index > found) {
+			if (index >= found) {
 				printError("wrong index for device in JTAG chain");
 				delete(jtag);
 				return EXIT_FAILURE;

@@ -159,6 +159,7 @@ class Jtag {
 	 * \return false if not found, true otherwise
 	 */
 	bool search_and_insert_device_with_idcode(uint32_t idcode);
+	void verify_chain_delays();
 	bool _verbose;
 	tapState_t _state;
 	int _tms_buffer_size;
@@ -180,6 +181,8 @@ class Jtag {
 
 	std::vector<uint32_t> _devices_list; /*!< ordered list of devices idcode */
 	std::vector<int16_t> _irlength_list; /*!< ordered list of irlength */
+	/* Extra shift stages between a device and its TDI-side neighbor. */
+	std::vector<unsigned> _chain_delays;
 	uint8_t _curr_tdi;
 };
 #endif  // SRC_JTAG_HPP_

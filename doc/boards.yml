@@ -415,6 +415,13 @@
   FPGA: MAX 10 10M50DAF484C6GES
   Memory: OK
 
+- ID: stratix10gx
+  Description: Intel Stratix 10 GX FPGA Development Kit (DK-DEV-1SGX-L-A)
+  URL: https://www.altera.com/products/boards-and-kits/dev-kits/altera/kit-s10-fpga.html
+  FPGA: Stratix 10 GX 1SG280LU2F50E2VG
+  Memory: RBF
+  Flash: NT
+
 - ID: dragonL
   Description: KNJN Dragon-L PCI Express & HDMI FPGA board
   URL: https://www.knjn.com/FPGA-Dragon-L.html
