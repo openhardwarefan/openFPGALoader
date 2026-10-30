@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # set the project name
-project(openFPGALoader VERSION "1.2.0" LANGUAGES CXX)
+project(openFPGALoader VERSION "1.2.99" LANGUAGES CXX)
 
 # Let modern CMake de-duplicate libraries for Apple's linker.
 if(APPLE AND POLICY CMP0156)
