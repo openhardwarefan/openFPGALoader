@@ -55,7 +55,9 @@ class FX2_ll {
 		 * \return -1 when transfer fails, number of bytes otherwise
 		 */
 		int read(uint8_t endpoint, uint8_t *buff, uint16_t len);
-		/*! Quiet bulk read with custom timeout (ms); no error print. */
+		/*! Quiet bulk read with custom timeout (ms); preserves bytes on timeout.
+		 * Returns the byte count (zero for an empty timeout), or a libusb error.
+		 */
 		int read_quiet(uint8_t endpoint, uint8_t *buff, uint16_t len, unsigned timeout_ms);
 		/*! Clear halt on a complete endpoint address, including direction. */
 		bool clear_halt(uint8_t endpoint);

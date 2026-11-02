@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <iostream>
 #include <map>
 #include <string>
@@ -666,24 +667,33 @@ int UsbBlasterII::write(uint8_t *wr_buf, int wr_len,
 			return -EXIT_FAILURE;
 		}
 
-		int timeout = 100;
+		/* A timeout may include valid TDO bytes. Keep those bytes and allow
+		 * a delayed reply to arrive without replaying clocks or the 0x5f copy.
+		 * Bound the whole read, including repeated short/empty USB packets.
+		 */
+		const auto deadline = std::chrono::steady_clock::now()
+			+ std::chrono::seconds(3);
+		int attempts = 100;
 		int byte_read = 0;
-		while (byte_read < rd_len && timeout != 0) {
-			timeout--;
-			ret = fx2->read(8, rd_buf + byte_read, rd_len - byte_read);
+		while (byte_read < rd_len && attempts-- > 0) {
+			const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				deadline - std::chrono::steady_clock::now()).count();
+			if (remaining <= 0)
+				break;
+			ret = fx2->read_quiet(8, rd_buf + byte_read, rd_len - byte_read,
+				remaining < 1000 ? static_cast<unsigned>(remaining) : 1000);
 			if (ret < 0) {
-				printError("Read error: " + std::to_string(ret));
+				printError("USB-Blaster II read error: "
+					+ std::string(libusb_error_name(ret)));
 				return ret;
 			}
 			byte_read += ret;
 		}
 
 		if (byte_read != rd_len) {
-			printError("Error: timeout " + std::to_string(byte_read) +
-				" " + std::to_string(rd_len));
-			for (int i=0; i < byte_read; i++)
-				printf("%02x ", rd_buf[i]);
-			printf("\n");
+			printError("USB-Blaster II TDO timeout: received "
+				+ std::to_string(byte_read) + " of " + std::to_string(rd_len)
+				+ " bytes");
 			return -EXIT_FAILURE;
 		}
 		return byte_read;

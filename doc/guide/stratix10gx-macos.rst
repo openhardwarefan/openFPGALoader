@@ -59,3 +59,16 @@ included; its provenance and SHA-256 are in firmware/usbBlasterII/README.txt.
 
 Earlier RBF loading and application behavior were confirmed on the kit.
 Current hardware retesting and Windows runtime validation remain deferred.
+
+USB-Blaster II timeout handling
+==============================
+
+A successful firmware-version read does not guarantee that the first TDO
+reply will arrive within one second. TDO reads allow up to three seconds
+per reply and retain any bytes delivered with a USB timeout. Only the read
+is retried: replaying a JTAG command would clock the TAP again and corrupt
+the scan. Disconnects, endpoint stalls and overflows fail immediately;
+an incomplete reply also fails instead of continuing with missing data.
+
+The transport tests simulate delayed and split replies without hardware.
+Intermittent failures on a physical probe still require hardware retesting.

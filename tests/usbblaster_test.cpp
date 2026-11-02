@@ -12,6 +12,7 @@
 #include "jtag.hpp"
 #include "fx2_ll.hpp"
 #include "stratix10gx.hpp"
+#include "usbBlaster.hpp"
 
 static void require(bool condition, const char *message)
 {
@@ -28,6 +29,9 @@ struct Probe {
 	bool fail_write = false;
 	bool short_write = false, stall_read = false;
 	unsigned read_chunk = 0;
+	unsigned empty_reads = 0, read_calls = 0, write_calls = 0;
+	int read_error = 0;
+	std::deque<int> read_results;
 	std::deque<bool> shift;
 	std::deque<uint8_t> pending, input;
 	// IEEE 1149.1 state transitions, indexed by TMS.
@@ -112,7 +116,6 @@ static Probe probe;
 FX2_ll::FX2_ll(uint16_t, uint16_t, uint16_t, uint16_t, const std::string &) {}
 FX2_ll::~FX2_ll() = default;
 bool FX2_ll::clear_halt(uint8_t) { return true; }
-int FX2_ll::read_quiet(uint8_t, uint8_t *, uint16_t, unsigned) { return 0; }
 int FX2_ll::read_ctrl(uint8_t, uint16_t, uint8_t *data, uint16_t size, uint16_t)
 {
 	memset(data, 0, size);
@@ -120,13 +123,26 @@ int FX2_ll::read_ctrl(uint8_t, uint16_t, uint8_t *data, uint16_t size, uint16_t)
 }
 int FX2_ll::write(uint8_t, uint8_t *data, uint16_t size)
 {
+	probe.write_calls++;
 	if (probe.fail_write) return -1;
 	if (probe.short_write) return size - 1;
 	probe.command(data, size);
 	return size;
 }
-int FX2_ll::read(uint8_t, uint8_t *data, uint16_t size)
+static int read_response(uint8_t *data, uint16_t size)
 {
+	probe.read_calls++;
+	if (probe.read_error) return probe.read_error;
+	if (probe.empty_reads) {
+		probe.empty_reads--;
+		return 0;
+	}
+	if (!probe.read_results.empty()) {
+		const int result = probe.read_results.front();
+		probe.read_results.pop_front();
+		if (result <= 0) return result;
+		size = std::min<unsigned>(size, result);
+	}
 	if (probe.stall_read) return 0;
 	if (probe.read_chunk) size = std::min<unsigned>(size,probe.read_chunk);
 	require(probe.input.size() >= size, "unexpected USB read length");
@@ -135,6 +151,56 @@ int FX2_ll::read(uint8_t, uint8_t *data, uint16_t size)
 		probe.input.pop_front();
 	}
 	return size;
+}
+
+int FX2_ll::read(uint8_t, uint8_t *data, uint16_t size)
+{
+	const int ret = read_response(data, size);
+	// The original strict read reports a timeout as an error.
+	return ret == 0 ? -1 : ret;
+}
+
+int FX2_ll::read_quiet(uint8_t, uint8_t *data, uint16_t size, unsigned timeout_ms)
+{
+	if (timeout_ms == 50) return 0; // Constructor's stale-data drain.
+	return read_response(data, size);
+}
+
+static void read_recovery()
+{
+	probe = Probe();
+	UsbBlasterII cable("mock.hex");
+	uint8_t command = 0x4c, reply = 0xff;
+	probe.empty_reads = 2;
+	require(cable.write(&command, 1, &reply, 1) == 1,
+		"transient TDO timeout must allow the queued reply to arrive");
+	require(reply == 0 && probe.read_calls == 3, "delayed TDO reply");
+	require(probe.write_calls == 2, "read retry reissued JTAG commands or TDO copy");
+
+	probe = Probe();
+	probe.state = 4; // Shift-DR, with a known 40-bit reply.
+	probe.append(0x67452301, 32);
+	probe.append(0x89, 8);
+	probe.read_results = {2, 0, 1, 0, 2};
+	uint8_t shift[] = {0xc5, 0, 0, 0, 0, 0}, captured[5] = {};
+	const uint8_t expected[] = {0x01, 0x23, 0x45, 0x67, 0x89};
+	require(cable.write(shift, sizeof(shift), captured, sizeof(captured)) == 5,
+		"split TDO reply interrupted by timeouts");
+	require(memcmp(captured, expected, sizeof(expected)) == 0,
+		"partial TDO data overwritten or skipped after timeout");
+	require(probe.write_calls == 2 && probe.read_calls == 5,
+		"split TDO reply replayed the scan");
+
+	probe.read_error = LIBUSB_ERROR_NO_DEVICE;
+	const auto reads = probe.read_calls;
+	require(cable.write(&command, 1, &reply, 1) < 0, "disconnect accepted");
+	require(probe.read_calls == reads + 1, "disconnect retried as a timeout");
+
+	probe = Probe();
+	probe.stall_read = true;
+	require(cable.write(&command, 1, &reply, 1) < 0, "missing TDO reply accepted");
+	require(probe.read_calls <= 100 && probe.write_calls == 2,
+		"empty TDO reads were unbounded or replayed the command");
 }
 
 static void run(unsigned delay, uint32_t primary_id = 0xc32150dd)
@@ -265,6 +331,7 @@ int main()
 {
 	try {
 		board_defaults();
+		read_recovery();
 		run(0);
 		run(0,0x020b10dd); // Existing Cyclone II chain uses upstream JTAG scan behavior.
 		run(1);

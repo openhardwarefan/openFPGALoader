@@ -159,7 +159,7 @@ int FX2_ll::read_quiet(uint8_t endpoint, uint8_t *buff, uint16_t len,
 	int ret = libusb_bulk_transfer(dev_handle, LIBUSB_ENDPOINT_IN | endpoint,
 			buff, len, &actual_length, timeout_ms);
 	if (ret != LIBUSB_SUCCESS && ret != LIBUSB_ERROR_TIMEOUT)
-		return -1;
+		return ret;
 	return actual_length;
 }
 
