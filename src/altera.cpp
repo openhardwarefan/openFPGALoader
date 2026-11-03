@@ -1321,6 +1321,8 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 		uint64_t res;
 		bool busy, error;
 		unsigned polls = 0;
+		const auto poll_deadline = std::chrono::steady_clock::now()
+			+ std::chrono::seconds(30);
 		do {
 			_jtag->shiftIR((unsigned char *)stat_cmd, NULL, IRLENGTH);
 			_jtag->toggleClk(agilex_toggle_length);
@@ -1338,7 +1340,8 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 				return false;
 			}
 			stat_tx[0] = 0x01;
-			if (stratix10 && ++polls >= 6000 && busy) {
+			if (stratix10 && busy && (++polls >= 6000 ||
+				std::chrono::steady_clock::now() >= poll_deadline)) {
 				progress.fail();
 				char detail[192];
 				snprintf(detail, sizeof(detail), "Timed out waiting for configuration flow control at byte %u "
@@ -1353,7 +1356,7 @@ bool Altera::agilex_load_bitstream(const uint8_t *data, const uint32_t length)
 		// next position is provided by the FPGA
 		// it's a x 4
 		const uint32_t next = uint32_t(res) & ~uint32_t(3);
-		if (stratix10 && (next > offset_after_write || next > length ||
+		if (stratix10 && (next < wr_pos || next > offset_after_write || next > length ||
 			(next <= furthest && ++stalled >= 128))) {
 			progress.fail();
 			printError("Invalid or stalled configuration flow-control position");
@@ -1381,6 +1384,10 @@ bool Altera::agilex_program()
 
 	const uint32_t rbf_length = rbf.getLength() / 8;
 	const uint8_t *rbf_data = rbf.getData();
+	if (_fpga_family == STRATIX10_FAMILY && (!rbf_length || (rbf_length & 3))) {
+		printError("Stratix 10 RBF must contain a nonempty stream of 32-bit words");
+		return false;
+	}
 
 	if (!agilex_isc_init())
 		return false;

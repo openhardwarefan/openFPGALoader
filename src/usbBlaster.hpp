@@ -9,6 +9,7 @@
 #include <ftdi.h>
 #endif
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,14 @@
 #endif
 #include "fx2_ll.hpp"
 #include "jtagInterface.hpp"
+
+/* A missing TDO reply leaves the scan state unknown. Only initialization
+ * may recover by reopening the probe and resetting the entire TAP chain.
+ */
+class UsbBlasterReadTimeout : public std::runtime_error {
+ public:
+	UsbBlasterReadTimeout(): std::runtime_error("USB-Blaster II TDO reply timed out") {}
+};
 
 /*!
  * \file UsbBlaster.hpp
@@ -149,12 +158,15 @@ class UsbBlasterII: public UsbBlaster_ll {
 	public:
 		UsbBlasterII(const std::string &firmware_path);
 		virtual ~UsbBlasterII();
+		/* Discard TDO left inside the probe after command-FIFO synchronization. */
+		void discardTDO();
 
 		int setClkFreq(uint32_t clkHZ) override;
 		uint32_t getClkFreq() override;
 		int write(uint8_t *wr_buf, int wr_len,
 				uint8_t *rd_buf, int rd_len) override;
 	private:
+		void drainTDO();
 		FX2_ll *fx2;
 };
 #endif

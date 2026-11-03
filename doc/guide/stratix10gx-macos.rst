@@ -70,5 +70,49 @@ is retried: replaying a JTAG command would clock the TAP again and corrupt
 the scan. Disconnects, endpoint stalls and overflows fail immediately;
 an incomplete reply also fails instead of continuing with missing data.
 
-The transport tests simulate delayed and split replies without hardware.
+Initial chain detection allows ten attempts after a TDO timeout. Each
+retry closes and reopens the probe, clears endpoint halts, drains stale
+TDO, clears queued software TAP transitions and resets the hardware TAP
+before scanning the chain again. A scan that failed midway is never
+continued. Disconnects and other transport errors do not trigger this
+recovery. Once initialization finishes, a timeout aborts the operation;
+active programming is not restarted automatically.
+
+Startup drains both replies already queued on USB and samples still held
+inside the probe. After the command-FIFO wipe restores command boundaries,
+the loader sends the TDO-copy command and discards its reply before the
+first scan. Endpoint-clear failures, drain errors and continuously arriving
+stale data abort initialization. Closing the probe always releases its USB
+handle, including when the device has disconnected.
+
+FX2 firmware loading rejects parser errors and empty or incomplete images
+before resetting the CPU. Control transfers must complete their requested
+length, and firmware-loading failures release the claimed interface,
+device handle and USB context. Tests also load the bundled HEX through the
+mock transport to check the successful upload path.
+
+On Stratix 10 chains, initialization also sends known marker bits through
+the instruction register and BYPASS data path and compares their returned
+bits. This checks the JTAG scan path before programming, including chains
+without the extra scan stage observed on the tested kit. It does not read
+back FPGA configuration memory or compare it against the RBF. Programming
+completion is checked using SDM configuration status and CONF_DONE.
+
+Each RBF chunk receives an SDM flow-control status check before the next
+chunk is sent. Device errors, backward acknowledgments, offsets beyond the
+sent data and persistent lack of progress abort the transfer. Only the
+unaccepted suffix may be resent when the device accepts part of a chunk.
+Busy polling is limited to 6000 polls or 30 seconds per chunk, whichever
+comes first. Empty or non-word-aligned RBF input is rejected before SDM
+configuration begins. Final CONFIG_STATUS validation remains mandatory
+after every byte is acknowledged. These checks are always enabled; they
+are device status checks, not byte-for-byte configuration-memory readback.
+
+The transport tests simulate delayed and split replies, startup recovery,
+stale TDO in both buffers, retry exhaustion, cleanup failures and corrupted
+marker readback without hardware. Timeout injection covers every startup
+reply boundary.
+An independent SDM model also exercises the production Altera programming
+path with partial acceptance, device errors, forward/backward offsets,
+stalls, invalid input and missing final CONF_DONE.
 Intermittent failures on a physical probe still require hardware retesting.

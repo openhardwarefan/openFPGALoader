@@ -42,10 +42,13 @@ FX2_ll::FX2_ll(uint16_t uninit_vid, uint16_t uninit_pid,
 				throw std::runtime_error("claim interface failed");
 			}
 			/* load firmware */
-			if (!load_firmware(firmware_path)) {
-				libusb_close(dev_handle);
+			try {
+				if (!load_firmware(firmware_path))
+					throw std::runtime_error("fx2 firmware load failed");
+			} catch (...) {
+				close();
 				libusb_exit(usb_ctx);
-				throw std::runtime_error("fx2 firmware load failed");
+				throw;
 			}
 			close();
 			reenum = true;
@@ -69,6 +72,7 @@ FX2_ll::FX2_ll(uint16_t uninit_vid, uint16_t uninit_pid,
 
 	if (!dev_handle) {
 		progress.fail();
+		libusb_exit(usb_ctx);
 		throw std::runtime_error("FX2: fail to open device");
 	}
 	progress.done();
@@ -107,20 +111,15 @@ FX2_ll::~FX2_ll()
 bool FX2_ll::close()
 {
 	if (dev_handle) {
-        int ret;
-        ret = libusb_release_interface(dev_handle, 0);
-        if (ret != 0) {
-            /* device is already disconnected ... */
-            if (ret == LIBUSB_ERROR_NO_DEVICE) {
-                return true;
-            } else {
-                printError("Error: Fail to release interface");
-                return false;
-            }
-        }
-        libusb_close(dev_handle);
-        dev_handle = NULL;
-    }
+		const int ret = libusb_release_interface(dev_handle, 0);
+		/* A failed release does not free the handle, even on disconnect. */
+		libusb_close(dev_handle);
+		dev_handle = NULL;
+		if (ret != 0 && ret != LIBUSB_ERROR_NO_DEVICE) {
+			printError("Error: Fail to release interface");
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -181,6 +180,11 @@ int FX2_ll::write_ctrl(uint8_t bRequest, uint16_t wValue,
 				+ std::string(libusb_error_name(ret)));
 		return false;
 	}
+	if (ret != len) {
+		printError("Short FX2 control write: " + std::to_string(ret)
+			+ " of " + std::to_string(len) + " bytes");
+		return false;
+	}
 	return true;
 }
 
@@ -197,6 +201,11 @@ int FX2_ll::read_ctrl(uint8_t bRequest, uint16_t wValue,
 				+ std::string(libusb_error_name(ret)));
 		return false;
 	}
+	if (ret != len) {
+		printError("Short FX2 control read: " + std::to_string(ret)
+			+ " of " + std::to_string(len) + " bytes");
+		return false;
+	}
 	return true;
 }
 
@@ -207,13 +216,24 @@ int FX2_ll::read_ctrl(uint8_t bRequest, uint16_t wValue,
 bool FX2_ll::load_firmware(std::string firmware_path)
 {
 	IhexParser ihex(firmware_path, false, true);
-	ihex.parse();
+	if (ihex.parse() != EXIT_SUCCESS)
+		return false;
+	std::vector<IhexParser::data_line_t> data = ihex.getDataArray();
+	size_t firmware_size = 0;
+	for (const auto &section : data) {
+		if (section.line_data.size() != section.length)
+			return false;
+		firmware_size += section.length;
+	}
+	if (firmware_size == 0 || firmware_size * 8 != static_cast<size_t>(ihex.getLength())) {
+		printError("Empty or incomplete FX2 firmware image");
+		return false;
+	}
 
 	/* reset */
 	if (!reset(1))
 		return false;
 	/* load */
-	std::vector<IhexParser::data_line_t> data = ihex.getDataArray();
 	ProgressBar progress("Loading firmware", data.size(), 50, false);
 	for (size_t i = 0; i < data.size(); i++) {
 		IhexParser::data_line_t data_line = data[i];

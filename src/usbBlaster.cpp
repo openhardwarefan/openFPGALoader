@@ -86,13 +86,20 @@ UsbBlaster::UsbBlaster(const cable_t &cable, const std::string &firmware_path,
 			tmp_buf[_nb_bit + 1] = val | _tck_pin;
 		}
 
-		if (ll_driver->write(tmp_buf, _nb_bit, NULL, 0) != _nb_bit) {
+		try {
+			if (ll_driver->write(tmp_buf, _nb_bit, NULL, 0) != _nb_bit)
+				throw std::runtime_error("Unable to initialize USB-Blaster command FIFO");
+			_nb_bit = 0;
+			_curr_tms = _tms_pin;
+#ifdef ENABLE_USB_BLASTERII
+			if (_is_blasterII)
+				static_cast<UsbBlasterII *>(ll_driver)->discardTDO();
+#endif
+		} catch (...) {
 			free(_in_buf);
 			delete ll_driver;
-			throw std::runtime_error("Unable to initialize USB-Blaster command FIFO");
+			throw;
 		}
-		_nb_bit = 0;
-		_curr_tms = _tms_pin;
 	}
 }
 
@@ -500,6 +507,8 @@ int UsbBlaster::write(bool read, int rd_len)
 	int ret = ll_driver->write(_in_buf, _nb_bit,
 			(read)?_in_buf:NULL, rd_len);
 	_nb_bit = 0;
+	if (_is_blasterII && read && ret == LIBUSB_ERROR_TIMEOUT)
+		throw UsbBlasterReadTimeout();
 	return _is_blasterII && ret != expected ? -EXIT_FAILURE : ret;
 }
 
@@ -614,21 +623,44 @@ UsbBlasterII::UsbBlasterII(const std::string &firmware_path)
 	else
 		fpath = firmware_path;
 	fx2 = new FX2_ll(0x09fb, 0x6810, 0x09fb, 0x6010, fpath);
-	if (fx2->read_ctrl(0x94, 0, buf, 5, 0x0000) <= 0) {
-		delete fx2;
-		throw std::runtime_error("Unable to read firmware version.");
-	}
-	printInfo("USB-Blaster II firmware version: " + std::string((char *)buf));
+	try {
+		if (fx2->read_ctrl(0x94, 0, buf, 5, 0x0000) <= 0)
+			throw std::runtime_error("Unable to read firmware version.");
+		printInfo("USB-Blaster II firmware version: " + std::string((char *)buf));
 
-	/* Recover from a previous OVERFLOW/halt and drain leftover TDO. */
-	fx2->clear_halt(0x04); /* OUT EP4 commands */
-	fx2->clear_halt(0x88); /* IN EP8 TDO */
+		/* Clear endpoint halts and drain USB before sending the FIFO wipe. */
+		if (!fx2->clear_halt(0x04) || !fx2->clear_halt(0x88))
+			throw std::runtime_error("Unable to clear USB-Blaster II endpoint halts");
+		drainTDO();
+	} catch (...) {
+		delete fx2;
+		throw;
+	}
+}
+
+void UsbBlasterII::drainTDO()
+{
 	uint8_t flush_buf[512];
 	for (int i = 0; i < 16; i++) {
-		int n = fx2->read_quiet(8, flush_buf, sizeof(flush_buf), 50);
-		if (n <= 0)
-			break;
+		const int n = fx2->read_quiet(8, flush_buf, sizeof(flush_buf), 50);
+		if (n < 0)
+			throw std::runtime_error("Unable to drain USB-Blaster II TDO: "
+				+ std::string(libusb_error_name(n)));
+		if (n == 0)
+			return;
 	}
+	throw std::runtime_error("USB-Blaster II TDO did not become quiet");
+}
+
+void UsbBlasterII::discardTDO()
+{
+	/* The FIFO wipe has restored command boundaries. Release stale samples
+	 * still inside the probe before the first real scan can see them.
+	 */
+	uint8_t copy = 0x5f;
+	if (fx2->write(4, &copy, 1) != 1)
+		throw std::runtime_error("Unable to flush USB-Blaster II TDO buffer");
+	drainTDO();
 }
 
 UsbBlasterII::~UsbBlasterII()
@@ -694,7 +726,7 @@ int UsbBlasterII::write(uint8_t *wr_buf, int wr_len,
 			printError("USB-Blaster II TDO timeout: received "
 				+ std::to_string(byte_read) + " of " + std::to_string(rd_len)
 				+ " bytes");
-			return -EXIT_FAILURE;
+			return LIBUSB_ERROR_TIMEOUT;
 		}
 		return byte_read;
 	}

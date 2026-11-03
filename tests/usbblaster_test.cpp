@@ -13,6 +13,7 @@
 #include "fx2_ll.hpp"
 #include "stratix10gx.hpp"
 #include "usbBlaster.hpp"
+#include "altera.hpp"
 
 static void require(bool condition, const char *message)
 {
@@ -32,6 +33,20 @@ struct Probe {
 	unsigned empty_reads = 0, read_calls = 0, write_calls = 0;
 	int read_error = 0;
 	std::deque<int> read_results;
+	unsigned opens = 0, closes = 0, timeout_opens = 0, timeout_after_reads = 0;
+	unsigned fail_open = 0;
+	unsigned drained = 0;
+	bool corrupt_scan = false;
+	bool halt_failure = false, endless_tdo = false, drain_after_copy = false;
+	int drain_error = 0;
+	unsigned copies = 0, drain_calls = 0;
+	bool sdm = false, waiting_for_ack = false, final_done = true;
+	unsigned accepted = 0, chunks = 0, flow_reads = 0, busy_polls = 0;
+	enum FlowFault { NORMAL, PARTIAL, BUSY, BUSY_FOREVER, ERROR, FORWARD, BACKWARD, STALL } flow_fault = NORMAL;
+	uint64_t flow_status = 0;
+	std::vector<bool> written_dr;
+	std::vector<uint8_t> design;
+	std::deque<uint64_t> mailbox;
 	std::deque<bool> shift;
 	std::deque<uint8_t> pending, input;
 	// IEEE 1149.1 state transitions, indexed by TMS.
@@ -40,7 +55,7 @@ struct Probe {
 		{1,2}, {10,0}, {11,12}, {11,12}, {13,15}, {13,14}, {11,15}, {1,2}
 	};
 
-	void append(uint32_t value, unsigned bits)
+	void append(uint64_t value, unsigned bits)
 	{
 		for (unsigned i = 0; i < bits; i++)
 			shift.push_back((value >> i) & 1);
@@ -56,6 +71,7 @@ struct Probe {
 	{
 		sampled = shift.empty() ? 0 : shift.front();
 		if (state == 4 || state == 11) {
+			if (state == 4 && sdm) written_dr.push_back(tdi);
 			shift.pop_front();
 			shift.push_back(tdi);
 		}
@@ -72,8 +88,48 @@ struct Probe {
 			instruction[0] = extract(0, 10);
 			instruction[1] = extract(10 + ir_delay, 10);
 		}
+		if (state == 8 && sdm && instruction[0] == 2) {
+			require(!waiting_for_ack, "next chunk sent before SDM acknowledged its predecessor");
+			require(written_dr.size() >= 66, "truncated SDM data frame");
+			const unsigned bytes = (written_dr.size() - 66) / 8;
+			require(accepted + bytes <= design.size(), "chunk extends beyond design");
+			for (unsigned i = 0; i < bytes * 8; i++)
+				require(written_dr[64 + i] == ((design[accepted + i/8] >> (i%8)) & 1),
+					"SDM data does not match the RBF at the acknowledged position");
+			chunks++;
+			waiting_for_ack = true;
+			flow_status = accepted + bytes;
+			if (flow_fault == PARTIAL && chunks == 1) flow_status = accepted + bytes/2;
+			if (flow_fault == BUSY) busy_polls = 2;
+			if (flow_fault == BUSY_FOREVER) busy_polls = 6001;
+			if (flow_fault == ERROR) flow_status |= 3;
+			if (flow_fault == FORWARD) flow_status += 4;
+			if (flow_fault == BACKWARD && chunks == 2) flow_status = accepted - 4;
+			if (flow_fault == STALL) flow_status = accepted;
+		}
 		if (state == 3) {
 			shift.clear();
+			written_dr.clear();
+			if (sdm && instruction[0] == 0x202) {
+				const uint64_t status = mailbox.empty() ? (final_done ? 7 : 3) : mailbox.front();
+				if (!mailbox.empty()) mailbox.pop_front();
+				append(status, 34);
+				append(0, 1);
+				return;
+			}
+			if (sdm && instruction[0] == 0x208) {
+				append(flow_status | (busy_polls ? 1 : 0), 37);
+				append(0, 1);
+				if (waiting_for_ack) {
+					flow_reads++;
+					if (busy_polls) busy_polls--;
+					else {
+						waiting_for_ack = false;
+						accepted = uint32_t(flow_status) & ~3u;
+					}
+				}
+				return;
+			}
 			append(instruction[0] == 6 ? primary_id : 0,
 				instruction[0] == 6 ? 32 : 1);
 			append(1, dr_delay);
@@ -86,6 +142,7 @@ struct Probe {
 		for (unsigned i = 0; i < size; i++) {
 			uint8_t v = data[i];
 			if (v == 0x5f) {
+				copies++;
 				input.insert(input.end(), pending.begin(), pending.end());
 				pending.clear();
 			} else if (v & 0x80) {
@@ -113,9 +170,13 @@ struct Probe {
 static Probe probe;
 
 // Mock only the physical FX2 transport. Exercise the production cable and TAP code.
-FX2_ll::FX2_ll(uint16_t, uint16_t, uint16_t, uint16_t, const std::string &) {}
-FX2_ll::~FX2_ll() = default;
-bool FX2_ll::clear_halt(uint8_t) { return true; }
+FX2_ll::FX2_ll(uint16_t, uint16_t, uint16_t, uint16_t, const std::string &)
+{
+	if (++probe.opens == probe.fail_open)
+		throw std::runtime_error("mock reopen failure");
+}
+FX2_ll::~FX2_ll() { probe.closes++; }
+bool FX2_ll::clear_halt(uint8_t) { return !probe.halt_failure; }
 int FX2_ll::read_ctrl(uint8_t, uint16_t, uint8_t *data, uint16_t size, uint16_t)
 {
 	memset(data, 0, size);
@@ -133,6 +194,9 @@ static int read_response(uint8_t *data, uint16_t size)
 {
 	probe.read_calls++;
 	if (probe.read_error) return probe.read_error;
+	if (probe.timeout_opens && probe.opens <= probe.timeout_opens &&
+		probe.read_calls > probe.timeout_after_reads)
+		return 0;
 	if (probe.empty_reads) {
 		probe.empty_reads--;
 		return 0;
@@ -148,6 +212,8 @@ static int read_response(uint8_t *data, uint16_t size)
 	require(probe.input.size() >= size, "unexpected USB read length");
 	for (unsigned i = 0; i < size; i++) {
 		data[i] = probe.input.front();
+		if (probe.corrupt_scan && probe.instruction[0] == 1023)
+			data[i] ^= 1;
 		probe.input.pop_front();
 	}
 	return size;
@@ -162,8 +228,126 @@ int FX2_ll::read(uint8_t, uint8_t *data, uint16_t size)
 
 int FX2_ll::read_quiet(uint8_t, uint8_t *data, uint16_t size, unsigned timeout_ms)
 {
-	if (timeout_ms == 50) return 0; // Constructor's stale-data drain.
+	if (timeout_ms == 50) {
+		probe.drain_calls++;
+		if (!probe.drain_after_copy || probe.copies) {
+			if (probe.drain_error) return probe.drain_error;
+			if (probe.endless_tdo) {
+				memset(data, 0xa5, size);
+				return size;
+			}
+		}
+		const auto count = std::min<size_t>(size, probe.input.size());
+		for (size_t i = 0; i < count; i++) {
+			data[i] = probe.input.front();
+			probe.input.pop_front();
+		}
+		probe.drained += count;
+		return count;
+	}
 	return read_response(data, size);
+}
+
+static void startup_drain()
+{
+	const std::map<uint32_t, misc_device> misc;
+	probe = Probe();
+	probe.input = {0xba, 0xdc, 0x0f, 0xfe}; // Already on USB.
+	probe.pending = {0xde, 0xad, 0xbe, 0xef}; // Still inside the probe.
+	{
+		Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+			0, "", 0, false, "mock.hex", misc);
+		require(j.get_chain_len() == 2, "stale probe data contaminated IDCODE detection");
+		require(probe.drained == 8, "startup did not discard both sources of stale TDO");
+	}
+	require(probe.opens == probe.closes, "successful startup leaked the probe");
+	for (unsigned fault = 0; fault < 4; fault++) {
+		probe = Probe();
+		probe.halt_failure = fault == 0;
+		probe.drain_error = fault == 1 || fault == 2 ? LIBUSB_ERROR_NO_DEVICE : 0;
+		probe.drain_after_copy = fault >= 2;
+		probe.endless_tdo = fault == 3;
+		bool failed = false;
+		try {
+			Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+				0, "", 0, false, "mock.hex", misc);
+		} catch (const std::runtime_error &) { failed = true; }
+		require(failed, "startup accepted a failed or incomplete TDO drain");
+		require(probe.opens == 1 && probe.closes == 1, "startup failure leaked or retried the probe");
+		require(probe.read_calls == 0, "startup scanned before the TDO drain finished");
+		require(probe.drain_calls < 20, "TDO drain was unbounded");
+	}
+}
+
+static void initialization_recovery()
+{
+	const std::map<uint32_t, misc_device> misc;
+	probe = Probe();
+	unsigned initialization_reads;
+	{
+		Jtag baseline(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+			0, "", 0, false, "mock.hex", misc);
+		initialization_reads = probe.read_calls;
+	}
+	for (unsigned timeouts : {1u, 3u, 9u, 10u}) {
+		// Inject the timeout at every reply boundary, including marker scans.
+		for (unsigned preceding_reads = 0; preceding_reads < initialization_reads; preceding_reads++) {
+			probe = Probe();
+			probe.timeout_opens = timeouts;
+			probe.timeout_after_reads = preceding_reads;
+			bool failed = false;
+			try {
+				Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+					0, "", 0, false, "mock.hex", misc);
+				require(j.get_chain_len() == 2, "recovery retained partial chain entries");
+				j.device_select(1);
+				uint8_t ir[2] = {6, 0}, rx[4] = {};
+				j.shiftIR(ir, NULL, 10);
+				j.shiftDR(NULL, rx, 32);
+				require(rx[0] == 0xdd && rx[1] == 0x50 && rx[2] == 0x21 && rx[3] == 0xc3,
+					"recovered chain returned a stale or misaligned IDCODE");
+			} catch (const std::runtime_error &) { failed = true; }
+			require(failed == (timeouts == 10), "initialization retry bound");
+			require(probe.opens == std::min(timeouts + 1, 10u), "unexpected probe reopen count");
+			require(probe.opens == probe.closes, "probe leaked during recovery");
+			require(probe.drained > 0, "recovery did not drain stale TDO");
+		}
+	}
+	probe = Probe();
+	probe.read_error = LIBUSB_ERROR_NO_DEVICE;
+	bool failed = false;
+	try {
+		Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+			0, "", 0, false, "mock.hex", misc);
+	} catch (const std::runtime_error &) { failed = true; }
+	require(failed && probe.opens == 1 && probe.closes == 1, "disconnect reopened the probe");
+
+	probe = Probe();
+	probe.timeout_opens = 1;
+	probe.fail_open = 2;
+	failed = false;
+	try {
+		Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+			0, "", 0, false, "mock.hex", misc);
+	} catch (const std::runtime_error &) { failed = true; }
+	require(failed && probe.opens == 2 && probe.closes == 1,
+		"failed reopen leaked or reused the closed probe");
+
+	probe = Probe();
+	probe.corrupt_scan = true;
+	failed = false;
+	try {
+		Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+			0, "", 0, false, "mock.hex", misc);
+	} catch (const std::runtime_error &) { failed = true; }
+	require(failed && probe.opens == 1, "corrupted BYPASS readback accepted or blindly retried");
+
+	probe = Probe();
+	probe.primary_id = 0x020b10dd; // Cyclone II: preserve existing initialization.
+	probe.corrupt_scan = true;
+	Jtag other(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+		0, "", 0, false, "mock.hex", misc);
+	require(other.get_chain_len() == 2, "Stratix marker checks changed another FPGA's startup");
 }
 
 static void read_recovery()
@@ -271,12 +455,14 @@ static void run(unsigned delay, uint32_t primary_id = 0xc32150dd)
 	require(probe.state == old_state, "empty scan changed TAP state");
 	for (bool short_write : {false,true}) {
 		bool failed = false;
+		const auto opens = probe.opens;
 		probe.short_write = short_write;
 		probe.stall_read = !short_write;
 		try { j.read_write(NULL,bypass,8,false); }
 		catch (const std::runtime_error &) { failed = true; }
 		probe.short_write = probe.stall_read = false;
 		require(failed, "incomplete USB transfer accepted");
+		require(probe.opens == opens, "scan outside initialization reopened the probe");
 	}
 	probe.pending.clear(); probe.input.clear();
 	bool failed = false;
@@ -327,11 +513,79 @@ static void board_defaults()
 	require(targetIndex({0xc32150dd,0x032250dd}) == -2,"ambiguous FPGA selection accepted");
 }
 
+static void sdm_chunk_checks()
+{
+	const auto path = std::filesystem::temp_directory_path()/
+		("openfpga-sdm-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".rbf");
+	const std::map<uint32_t, misc_device> misc;
+	try {
+		struct Case { Probe::FlowFault fault; unsigned size; bool done; };
+		for (const auto &test : {Case{Probe::NORMAL, 16384, true},
+			Case{Probe::BUSY, 16384, true}, Case{Probe::BUSY_FOREVER, 16384, true},
+			Case{Probe::PARTIAL, 16384, true}, Case{Probe::ERROR, 16384, true},
+			Case{Probe::FORWARD, 16384, true}, Case{Probe::BACKWARD, 16384, true},
+			Case{Probe::STALL, 16384, true}, Case{Probe::NORMAL, 16384, false},
+			Case{Probe::NORMAL, 0, true}, Case{Probe::NORMAL, 7, true}}) {
+			const auto fault = test.fault;
+			probe = Probe();
+			probe.flow_fault = fault;
+			probe.final_done = test.done;
+			probe.design.resize(test.size);
+			for (size_t i = 0; i < probe.design.size(); i++) probe.design[i] = uint8_t(i * 73 + i/256);
+			std::ofstream file(path, std::ios::binary);
+			file.write(reinterpret_cast<const char *>(probe.design.data()), probe.design.size());
+			file.close();
+			Jtag j(cable_list.at("usb-blasterII"), NULL, "", "", 24000000,
+				0, "", 0, false, "mock.hex", misc);
+			j.device_select(1);
+			probe.sdm = true;
+			probe.mailbox = {3, 0x3c0004001, ((0x208adc8a6ull << 2) | 3) & 0x3ffffffffull,
+				3, 0x4001, 1, 1, 1, test.done ? 7u : 3u};
+			Altera fpga(&j, path.string(), "rbf", Device::WR_SRAM, "", "", true, -1, "", false, false);
+			bool failed = false;
+			try { fpga.program(0, false); }
+			catch (const std::runtime_error &) { failed = true; }
+			const bool invalid_input = !test.size || (test.size & 3);
+			require(failed == (invalid_input || !test.done ||
+				(fault != Probe::NORMAL && fault != Probe::PARTIAL && fault != Probe::BUSY)),
+				"SDM chunk acceptance result");
+			require(probe.flow_reads >= probe.chunks, "not every chunk received an SDM status check");
+			if (fault == Probe::BUSY)
+				require(probe.flow_reads == probe.chunks * 3, "busy chunk was not polled until accepted");
+			if (fault == Probe::BUSY_FOREVER)
+				require(probe.chunks == 1 && probe.flow_reads <= 6000, "busy polling was unbounded");
+			if (!failed) {
+				require(probe.accepted == probe.design.size(), "configuration finished before all data was accepted");
+				require(probe.mailbox.empty(), "configuration skipped final CONFIG_STATUS validation");
+			}
+			if (fault == Probe::ERROR || fault == Probe::FORWARD)
+				require(probe.chunks == 1, "data sent after an invalid chunk acknowledgment");
+			if (fault == Probe::BACKWARD)
+				require(probe.chunks == 2, "backward acknowledgment caused old data to be resent");
+			if (fault == Probe::STALL)
+				require(probe.chunks <= 128, "unaccepted chunk retried indefinitely");
+			if (invalid_input)
+				require(probe.chunks == 0 && probe.mailbox.size() == 9,
+					"invalid RBF entered SDM configuration mode");
+			if (!test.done)
+				require(probe.accepted == probe.design.size(),
+					"missing CONF_DONE was not tested after all chunks were accepted");
+		}
+	} catch (...) {
+		std::filesystem::remove(path);
+		throw;
+	}
+	std::filesystem::remove(path);
+}
+
 int main()
 {
 	try {
 		board_defaults();
 		read_recovery();
+		startup_drain();
+		initialization_recovery();
+		sdm_chunk_checks();
 		run(0);
 		run(0,0x020b10dd); // Existing Cyclone II chain uses upstream JTAG scan behavior.
 		run(1);

@@ -234,7 +234,31 @@ Jtag::Jtag(const cable_t &cable, const jtag_pins_conf_t *pin_conf,
 	memset(_tms_buffer, 0, _tms_buffer_size);
 
 	try {
-		detectChain(32);
+		const unsigned initialization_attempts = 10;
+		for (unsigned attempt = 0; attempt < initialization_attempts; attempt++) {
+#ifdef ENABLE_USBBLASTER
+			try {
+#endif
+				detectChain(32);
+				break;
+#ifdef ENABLE_USBBLASTER
+			} catch (const UsbBlasterReadTimeout &) {
+				if (cable.type != MODE_USBBLASTER ||
+					(cable.pid != 0x6810 && cable.pid != 0x6010) ||
+					attempt + 1 >= initialization_attempts)
+					throw;
+				printWarn("USB-Blaster II initialization timed out; reopening probe "
+					"and resetting JTAG (attempt " + std::to_string(attempt + 2) + "/"
+					+ std::to_string(initialization_attempts) + ")");
+				delete _jtag;
+				_jtag = nullptr;
+				_num_tms = 0;
+				_state = RUN_TEST_IDLE;
+				memset(_tms_buffer, 0, _tms_buffer_size);
+				_jtag = new UsbBlaster(cable, firmware_path, verbose);
+			}
+#endif
+		}
 	} catch (...) {
 		free(_tms_buffer);
 		delete _jtag;
@@ -354,7 +378,12 @@ void Jtag::verify_chain_delays()
 		extra += _chain_delays[i];
 		ir_length += _irlength_list[i];
 	}
-	if (!extra)
+	const bool stratix10 = std::any_of(_devices_list.begin(), _devices_list.end(),
+		[](uint32_t id) {
+			auto device = fpga_list.find(id);
+			return device != fpga_list.end() && device->second.family == "stratix 10";
+		});
+	if (!extra && !stratix10)
 		return;
 
 	/* Shift a marker followed by enough ones to leave every TAP in BYPASS.
@@ -372,13 +401,13 @@ void Jtag::verify_chain_delays()
 		for (unsigned i = 0; i < 32; i++) {
 			if (((rx[(delay + i) >> 3] >> ((delay + i) & 7)) & 1) !=
 				((marker[i >> 3] >> (i & 7)) & 1))
-				throw std::runtime_error("JTAG chain delay verification failed");
+				throw std::runtime_error("JTAG IR/DR scan readback verification failed");
 		}
 	};
 	verify(SHIFT_IR, ir_length + extra);
 	verify(SHIFT_DR, _devices_list.size() + extra);
 	if (_verbose)
-		printInfo("Verified extra JTAG scan stages: " + std::to_string(extra));
+		printInfo("Verified JTAG IR/DR scan path (extra stages: " + std::to_string(extra) + ")");
 	go_test_logic_reset();
 	flushTMS(true);
 }
